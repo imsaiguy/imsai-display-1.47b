@@ -4,15 +4,19 @@
 #include <string.h>
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "fonts.h"
 #include "photo.h"
+#include "leds.h"
 
 static const char *TAG = "hello_lcd";
 
@@ -243,13 +247,142 @@ static void render_scene(void)
     draw_text_centered(&font_sub, "ESP32-S3  -  Waveshare 1.47B", 134, 214, 176, 96);
 }
 
+// ------------------------------------------------------------------------------
+// Animated front-panel LEDs
+// The photo has all LEDs switched off. Every frame, a glow is added on top of each LED site.
+// The glow's colors come from a lit LED in the original photo (difference to a dark LED);
+// the brightness of every LED in every frame was measured from a recording of a real IMSAI.
+// ------------------------------------------------------------------------------
+#define GLOW_R    7                       // glow reaches 7 px from the LED center
+#define LUT_STEP  8                       // lookup entries per pixel of distance
+#define LUT_N     (GLOW_R * LUT_STEP + 2)
+
+static float glow_lut[LUT_N][3];          // RGB increase at the LED center and out to GLOW_R px
+
+static void init_glow(void)
+{
+    // radial profile of a lit LED minus a dark one, in photo pixels (bin r covers radius r..r+1)
+    static const float tab[12][3] = {
+        {91, 203, 150}, {109, 201, 151}, {121, 186, 149}, {119, 122, 100}, {86, 36, 27}, {81, 10, 10},
+        {78, 7, 10}, {60, 1, 5}, {32, 0, 0}, {18, 0, 0}, {1, 0, 0}, {0, 0, 0}};
+    const float k = 320.0f / 539.0f;      // screen pixels per photo pixel
+    static float raw[LUT_N][3];
+    for (int i = 0; i < LUT_N; i++) {
+        float rp = (i / (float)LUT_STEP) / k - 0.5f;
+        for (int c = 0; c < 3; c++) {
+            if (rp < 0) raw[i][c] = tab[0][c];
+            else if (rp >= 11) raw[i][c] = 0;
+            else { int lo = (int)rp; float f = rp - lo; raw[i][c] = tab[lo][c] * (1 - f) + tab[lo + 1][c] * f; }
+        }
+    }
+    // soften like the photo was softened by scaling it down (Gaussian, sigma 0.45 px)
+    const float sigma = 0.45f * LUT_STEP;
+    for (int i = 0; i < LUT_N; i++)
+        for (int c = 0; c < 3; c++) {
+            float a = 0, ws = 0;
+            for (int j = -8; j <= 8; j++) {
+                int s = i + j; if (s < 0) s = -s;                  // mirror at the center
+                float w = expf(-(j * j) / (2 * sigma * sigma));
+                a += w * (s < LUT_N ? raw[s][c] : 0.0f); ws += w;
+            }
+            glow_lut[i][c] = a / ws;
+        }
+}
+
+// Draw all LEDs for animation frame `f` into buf (which otherwise holds the plain photo)
+static void draw_leds(uint16_t *buf, int f)
+{
+    for (int i = 0; i < LED_COUNT; i++) {            // erase what the previous frame drew here
+        int cx = (int)floorf(led_xy[i][0]), cy = (int)floorf(led_xy[i][1]);
+        int x0 = cx - GLOW_R, x1 = cx + GLOW_R, y0 = cy - GLOW_R, y1 = cy + GLOW_R;
+        x0 = x0 < 0 ? 0 : x0;
+        x1 = x1 > W - 1 ? W - 1 : x1;
+        y0 = y0 < 0 ? 0 : y0;
+        y1 = y1 > H - 1 ? H - 1 : y1;
+        for (int y = y0; y <= y1; y++)
+            memcpy(&buf[y * W + x0], &photo_rgb565[y * W + x0], (x1 - x0 + 1) * sizeof(uint16_t));
+    }
+    uint16_t *saved = fb;
+    fb = buf;
+    for (int i = 0; i < LED_COUNT; i++) {
+        float lv = led_anim[f][i] * (1.0f / 255.0f);
+        if (lv <= 0.01f) continue;
+        float lx = led_xy[i][0], ly = led_xy[i][1];
+        int cx = (int)floorf(lx), cy = (int)floorf(ly);
+        for (int y = cy - GLOW_R; y <= cy + GLOW_R; y++) {
+            if (y < 0 || y >= H) continue;
+            for (int x = cx - GLOW_R; x <= cx + GLOW_R; x++) {
+                if (x < 0 || x >= W) continue;
+                float dx = x + 0.5f - lx, dy = y + 0.5f - ly;
+                float pos = sqrtf(dx * dx + dy * dy) * LUT_STEP;
+                if (pos >= GLOW_R * LUT_STEP) continue;
+                int p0 = (int)pos; float fr = pos - p0;
+                float r, g, b;
+                unpack(fb[y * W + x], &r, &g, &b);
+                r += lv * (glow_lut[p0][0] * (1 - fr) + glow_lut[p0 + 1][0] * fr);
+                g += lv * (glow_lut[p0][1] * (1 - fr) + glow_lut[p0 + 1][1] * fr);
+                b += lv * (glow_lut[p0][2] * (1 - fr) + glow_lut[p0 + 1][2] * fr);
+                fb[y * W + x] = pack(r, g, b);
+            }
+        }
+    }
+    fb = saved;
+}
+
+// ------------------------------------------------------------------------------
+// Sending frames. `fb` holds the photo with its LEDs. After the first full picture only the rows
+// that contain LEDs are sent again, which is about a third of the data. The "ImsaiGuy" scene takes
+// half a second to draw, so it is drawn once at start-up into `scene_buf` and kept ready.
+// ------------------------------------------------------------------------------
+static uint16_t *scene_buf;
+static SemaphoreHandle_t tx_done;                 // given when the last transfer has left the SPI bus
+static esp_lcd_panel_handle_t panel;
+static int led_y0, led_y1;                        // screen rows that contain LED glow
+
+static bool IRAM_ATTR on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *ev, void *ctx)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(tx_done, &woken);
+    return woken == pdTRUE;
+}
+
+static void wait_sent(void)                       // block until the previous transfer is finished
+{
+    xSemaphoreTake(tx_done, portMAX_DELAY);
+}
+
+static void send_rows(const uint16_t *buf, int y0, int y1)   // rows y0..y1 of buf; call wait_sent() first
+{
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, y0, W, y1 + 1, buf + y0 * W));
+}
+
 void app_main(void)
 {
     fb = heap_caps_malloc(W * H * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!fb) {
-        ESP_LOGE(TAG, "Out of memory for the frame buffer");
+    scene_buf = heap_caps_malloc(W * H * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!fb || !scene_buf) {
+        ESP_LOGE(TAG, "Out of memory for the frame buffers");
         return;
     }
+    memcpy(fb, photo_rgb565, sizeof(photo_rgb565));
+    {
+        uint16_t *keep = fb;
+        fb = scene_buf;
+        render_scene();
+        fb = keep;
+    }
+    init_glow();
+    led_y0 = H;
+    led_y1 = 0;
+    for (int i = 0; i < LED_COUNT; i++) {
+        int c = (int)floorf(led_xy[i][1]);
+        if (c - GLOW_R < led_y0) led_y0 = c - GLOW_R;
+        if (c + GLOW_R > led_y1) led_y1 = c + GLOW_R;
+    }
+    if (led_y0 < 0) led_y0 = 0;
+    if (led_y1 > H - 1) led_y1 = H - 1;
+    tx_done = xSemaphoreCreateBinary();
+    xSemaphoreGive(tx_done);
 
     // Backlight on (active level HIGH on this board)
     gpio_config_t bl = { .pin_bit_mask = 1ULL << PIN_BL, .mode = GPIO_MODE_OUTPUT };
@@ -277,8 +410,9 @@ void app_main(void)
         .trans_queue_depth = 10,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &io));
+    esp_lcd_panel_io_callbacks_t cbs = { .on_color_trans_done = on_color_done };
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io, &cbs, NULL));
 
-    esp_lcd_panel_handle_t panel;
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = PIN_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
@@ -293,24 +427,43 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, GAP_X, GAP_Y));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
-    // Alternate: photo for 5 s, then the "ImsaiGuy" scene for 5 s, forever.
-    // While one picture is on the screen, the next one is prepared in the frame buffer.
-    memcpy(fb, photo_rgb565, sizeof(photo_rgb565));
+    ESP_LOGI(TAG, "Free internal heap: %u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    // Alternate: the photo with its LEDs running for 5 s, then the "ImsaiGuy" scene for 5 s, forever.
+    // The LED animation is the recording of a real IMSAI (LED_FPS frames/s, looping); it keeps its
+    // place across the scene so the machine seems to run on while the scene is shown.
+    int64_t clip_us = 0;                            // position in the LED recording
     while (true) {
-        // --- photo ---
-        TickType_t t0 = xTaskGetTickCount();
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, W, H, fb));
+        // --- photo with animated LEDs ---
         ESP_LOGI(TAG, "Showing photo");
-        vTaskDelay(pdMS_TO_TICKS(150));        // let the transfer finish before reusing the buffer
-        render_scene();                        // prepare the ImsaiGuy scene while the photo is shown
-        vTaskDelayUntil(&t0, pdMS_TO_TICKS(5000));
+        int64_t t0 = esp_timer_get_time(), now;
+        int last = -1, frames = 0;
+        int64_t draw_us = 0;
+        while ((now = esp_timer_get_time()) - t0 < 5000000) {
+            int k = (int)(((now - t0 + clip_us) * LED_FPS / 1000000) % LED_FRAMES);
+            if (k == last) {
+                vTaskDelay(1);
+                continue;
+            }
+            wait_sent();                            // fb may only change once the last transfer is done
+            int64_t td = esp_timer_get_time();
+            draw_leds(fb, k);
+            draw_us += esp_timer_get_time() - td;
+            if (last < 0) send_rows(fb, 0, H - 1);  // first frame of the phase: the whole picture
+            else send_rows(fb, led_y0, led_y1);     // then only the rows with LEDs
+            last = k;
+            frames++;
+        }
+        clip_us += now - t0;
+        ESP_LOGI(TAG, "Photo phase: %d frames in %d ms, drawing the LEDs took %d us per frame", frames,
+                 (int)((now - t0) / 1000), frames ? (int)(draw_us / frames) : 0);
 
         // --- ImsaiGuy scene ---
-        t0 = xTaskGetTickCount();
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, W, H, fb));
+        wait_sent();
+        send_rows(scene_buf, 0, H - 1);
         ESP_LOGI(TAG, "Showing ImsaiGuy scene");
-        vTaskDelay(pdMS_TO_TICKS(150));
-        memcpy(fb, photo_rgb565, sizeof(photo_rgb565));   // prepare the photo while the scene is shown
-        vTaskDelayUntil(&t0, pdMS_TO_TICKS(5000));
+        TickType_t ts = xTaskGetTickCount();
+        memcpy(fb, photo_rgb565, sizeof(photo_rgb565));   // only the scene is in flight; put the plain photo back
+        vTaskDelayUntil(&ts, pdMS_TO_TICKS(5000));
     }
 }

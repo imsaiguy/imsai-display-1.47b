@@ -1,9 +1,13 @@
 ﻿IMSAI display project - Waveshare ESP32-S3-LCD-1.47B
-Archived 2026-11-18
+Archived 2026-11-18, LED animation added 2026-11-19
 
 What it does
   Alternates, every 5 seconds, a cleaned-up photo of the IMSAI 8080 front panel (hand removed, background
   blacked out) and an "ImsaiGuy" title scene with a gold frame, in landscape (320 x 172).
+  The 44 front-panel LEDs in the photo are animated (30 fps, looping) from a recording of a real IMSAI 8080.
+  (The recording itself is not in this repo; main\leds.h holds the measured brightness of every LED per frame.
+  tools\extract_leds.py regenerates leds.h from a recording; tools\led_sites.csv gives the LED positions in the photo.
+  Needs: pip install --user imageio-ffmpeg numpy. Run gen_image.ps1 afterwards if led_sites.csv changed.)
 
 Contents
   main\hello.c        the program (ESP-IDF v5.5.2, esp_lcd ST7789 driver, no graphics library)
@@ -13,7 +17,7 @@ Contents
   tools\gen_fonts.ps1 regenerates fonts.h from installed Windows fonts (Microsoft fonts: check licenses before
                       distributing firmware commercially)
   tools\gen_image.ps1 regenerates photo.h from assets\imsai8080.png
-  firmware\imsai_display_merged_0x0.bin   ready-to-flash image, SHA-256 F1F0A4431E29BDF34DBA04932FA9042000FB8D3FE26CDA4B418C9246D933EBF3
+  firmware\imsai_display_merged_0x0.bin   ready-to-flash image, SHA-256 1D8B647331823A4560AACC4AE9200A6EBAFE9B242013EE498BB44D9B1E8CC633
 
 Flash the ready-made image (any 1.47B board; replace COM9 with your port; BOOT+RESET for download mode if needed)
   python -m esptool --chip esp32s3 -p COM9 -b 460800 write_flash 0x0 firmware\imsai_display_merged_0x0.bin

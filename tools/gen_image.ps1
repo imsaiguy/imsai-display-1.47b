@@ -90,7 +90,7 @@ public static class ImgGen
         return b;
     }
 
-    public static string Run(string src, string headerOut, string previewOut, string debugOut, int W, int H)
+    public static string Run(string src, string headerOut, string previewOut, string debugOut, string sitesCsv, int W, int H)
     {
         float[] img; int sw, sh;
         using (Bitmap orig = new Bitmap(src)) { sw = orig.Width; sh = orig.Height; img = ToFloat(orig); }
@@ -190,6 +190,57 @@ public static class ImgGen
                 img[i * 3 + c] = img[i * 3 + c] * (1 - soft[i]) + fill[i * 3 + c] * soft[i];
         info.AppendFormat("hand removed ({0} px reconstructed); ", filled);
 
+        // ---------- 1b) Switch the lit LEDs off (the firmware draws them again, animated) ----------
+        // Each lit LED is covered by a copy of the nearest dark LED of the same row (soft-edged disc).
+        {
+            string[] ln = File.ReadAllLines(sitesCsv);
+            var rowName = new System.Collections.Generic.List<string>();
+            var lx = new System.Collections.Generic.List<float>();
+            var ly = new System.Collections.Generic.List<float>();
+            var lit = new System.Collections.Generic.List<bool>();
+            foreach (string l in ln)
+            {
+                if (l.Length == 0 || l[0] == '#') continue;
+                string[] p = l.Split(',');
+                rowName.Add(p[0]);
+                lx.Add(float.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture) + 29f);   // panel crop origin X0
+                ly.Add(float.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture) + 73f);   // panel crop origin Y0
+                lit.Add(p[4] == "1");
+            }
+            float[] orig = (float[])img.Clone();
+            const float R0 = 9f, R1 = 12f;
+            int patched = 0;
+            for (int i = 0; i < lx.Count; i++)
+            {
+                if (!lit[i]) continue;
+                int best = -1; float bd = 1e9f;
+                for (int j = 0; j < lx.Count; j++)
+                    if (!lit[j] && rowName[j] == rowName[i] && Math.Abs(lx[j] - lx[i]) < bd) { bd = Math.Abs(lx[j] - lx[i]); best = j; }
+                if (best < 0) continue;
+                float dx = lx[best] - lx[i], dy = ly[best] - ly[i];
+                for (int y = (int)(ly[i] - R1) - 1; y <= (int)(ly[i] + R1) + 1; y++)
+                    for (int x = (int)(lx[i] - R1) - 1; x <= (int)(lx[i] + R1) + 1; x++)
+                    {
+                        float d = (float)Math.Sqrt((x + 0.5f - lx[i]) * (x + 0.5f - lx[i]) + (y + 0.5f - ly[i]) * (y + 0.5f - ly[i]));
+                        if (d >= R1) continue;
+                        float w = d <= R0 ? 1f : 1f - (d - R0) / (R1 - R0);
+                        w = w * w * (3f - 2f * w);
+                        // bilinear sample of the donor
+                        float sx = x + dx, sy = y + dy;
+                        int x0 = (int)Math.Floor(sx - 0.5f), y0 = (int)Math.Floor(sy - 0.5f);
+                        float fx = sx - 0.5f - x0, fy = sy - 0.5f - y0;
+                        for (int c = 0; c < 3; c++)
+                        {
+                            float v = orig[(y0 * sw + x0) * 3 + c] * (1 - fx) * (1 - fy) + orig[(y0 * sw + x0 + 1) * 3 + c] * fx * (1 - fy)
+                                    + orig[((y0 + 1) * sw + x0) * 3 + c] * (1 - fx) * fy + orig[((y0 + 1) * sw + x0 + 1) * 3 + c] * fx * fy;
+                            img[(y * sw + x) * 3 + c] = img[(y * sw + x) * 3 + c] * (1 - w) + v * w;
+                        }
+                    }
+                patched++;
+            }
+            info.AppendFormat("{0} lit LEDs switched off; ", patched);
+        }
+
         // ---------- 2) Cut out just the front panel; everything outside becomes black ----------
         const float X0 = 29f, X1 = 568.2f, Y0 = 73f, Y1 = 273f, R = 6f;
         for (int y = 0; y < sh; y++)
@@ -249,6 +300,9 @@ public static class ImgGen
         acc = 0;
         for (int v = 0; v < 256; v++) { acc += hist[v]; if (acc >= cnt * 0.997) { hi = v; break; } }
         if (hi - lo < 64) { lo = 0; hi = 255; }
+        // With the LEDs switched off the bright end of the histogram is lower; keep the levels the picture had
+        // with the LEDs on (6..238) so the panel looks exactly as before.
+        lo = 6; hi = 238;
         info.AppendFormat("levels {0}..{1}; ", lo, hi);
         for (int i = 0; i < canvas.Length; i++)
         {
@@ -316,5 +370,5 @@ public static class ImgGen
 "@
 
 $root = Split-Path $PSScriptRoot -Parent
-$info = [ImgGen]::Run((Join-Path $root "assets\imsai8080.png"), (Join-Path $root "main\photo.h"), (Join-Path $root "assets\imsai8080_preview_320x172.png"), (Join-Path $root "assets\imsai8080_panel_handremoved.png"), 320, 172)
+$info = [ImgGen]::Run((Join-Path $root "assets\imsai8080.png"), (Join-Path $root "main\photo.h"), (Join-Path $root "assets\imsai8080_preview_320x172.png"), (Join-Path $root "assets\imsai8080_panel_handremoved.png"), (Join-Path $root "tools\led_sites.csv"), 320, 172)
 "Done: $info"
