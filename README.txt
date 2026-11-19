@@ -2,8 +2,8 @@ IMSAI display project - Waveshare ESP32-S3-LCD-1.47B
 Archived 2026-11-18, LED animation added 2026-11-19
 
 What it does
-  Alternates, every 5 seconds, an "ImsaiGuy" title scene (shown first after reset) and a cleaned-up photo of the IMSAI 8080
-  front panel (hand removed, background blacked out) with a gold frame, in landscape (320 x 172).
+  Alternates, every 5 seconds, an "ImsaiGuy" title scene with a gold frame (shown first after reset) and a cleaned-up photo of
+  the IMSAI 8080 front panel (hand removed, background blacked out), in landscape (320 x 172).
   The 44 front-panel LEDs in the photo are animated (30 fps, looping) from a recording of a real IMSAI 8080.
   (The recording itself is not in this repo; main\leds.h holds the measured brightness of every LED per frame.
   tools\extract_leds.py regenerates leds.h from a recording; tools\led_sites.csv gives the LED positions in the photo.
