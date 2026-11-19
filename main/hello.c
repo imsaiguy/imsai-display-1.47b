@@ -429,11 +429,19 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Free internal heap: %u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-    // Alternate: the photo with its LEDs running for 5 s, then the "ImsaiGuy" scene for 5 s, forever.
-    // The LED animation is the recording of a real IMSAI (LED_FPS frames/s, looping); it keeps its
-    // place across the scene so the machine seems to run on while the scene is shown.
+    // Alternate: the "ImsaiGuy" scene for 5 s (first after every reset), then the photo with its LEDs
+    // running for 5 s, forever. The LED animation is the recording of a real IMSAI (LED_FPS frames/s,
+    // looping); it keeps its place across the scene so the machine seems to run on meanwhile.
     int64_t clip_us = 0;                            // position in the LED recording
     while (true) {
+        // --- ImsaiGuy scene ---
+        wait_sent();
+        send_rows(scene_buf, 0, H - 1);
+        ESP_LOGI(TAG, "Showing ImsaiGuy scene");
+        TickType_t ts = xTaskGetTickCount();
+        memcpy(fb, photo_rgb565, sizeof(photo_rgb565));   // only the scene is in flight; put the plain photo back
+        vTaskDelayUntil(&ts, pdMS_TO_TICKS(5000));
+
         // --- photo with animated LEDs ---
         ESP_LOGI(TAG, "Showing photo");
         int64_t t0 = esp_timer_get_time(), now;
@@ -457,13 +465,5 @@ void app_main(void)
         clip_us += now - t0;
         ESP_LOGI(TAG, "Photo phase: %d frames in %d ms, drawing the LEDs took %d us per frame", frames,
                  (int)((now - t0) / 1000), frames ? (int)(draw_us / frames) : 0);
-
-        // --- ImsaiGuy scene ---
-        wait_sent();
-        send_rows(scene_buf, 0, H - 1);
-        ESP_LOGI(TAG, "Showing ImsaiGuy scene");
-        TickType_t ts = xTaskGetTickCount();
-        memcpy(fb, photo_rgb565, sizeof(photo_rgb565));   // only the scene is in flight; put the plain photo back
-        vTaskDelayUntil(&ts, pdMS_TO_TICKS(5000));
     }
 }
