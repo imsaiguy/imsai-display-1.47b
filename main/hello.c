@@ -4,6 +4,7 @@
 #include <string.h>
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/rmt_tx.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -356,8 +357,42 @@ static void send_rows(const uint16_t *buf, int y0, int y1)   // rows y0..y1 of b
     ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, y0, W, y1 + 1, buf + y0 * W));
 }
 
+// ---- On-board addressable RGB LED (GPIO 38, one-wire WS2812-style), driven with the RMT peripheral ----
+#define PIN_RGB      38
+#define RGB_LEVEL    24        // brightness cap per colour (0..255); the LED is very bright at full power
+static rmt_channel_handle_t rgb_chan;
+static rmt_encoder_handle_t rgb_enc;
+
+static void rgb_init(void)
+{
+    rmt_tx_channel_config_t ch = {
+        .gpio_num = PIN_RGB,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,           // 0.1 us per tick
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 1,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&ch, &rgb_chan));
+    rmt_bytes_encoder_config_t enc = {
+        .bit0 = { .level0 = 1, .duration0 = 3, .level1 = 0, .duration1 = 9 },   // 0.3 us high, 0.9 us low
+        .bit1 = { .level0 = 1, .duration0 = 9, .level1 = 0, .duration1 = 3 },   // 0.9 us high, 0.3 us low
+        .flags.msb_first = 1,
+    };
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&enc, &rgb_enc));
+    ESP_ERROR_CHECK(rmt_enable(rgb_chan));
+}
+
+static void rgb_set(uint8_t r, uint8_t g, uint8_t b)    // this board's LED takes R, G, B (checked by eye); the idle-low line latches it
+{
+    uint8_t px[3] = { r, g, b };
+    rmt_transmit_config_t tx = { .loop_count = 0 };
+    ESP_ERROR_CHECK(rmt_transmit(rgb_chan, rgb_enc, px, sizeof(px), &tx));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(rgb_chan, portMAX_DELAY));
+}
+
 void app_main(void)
 {
+    rgb_init();
     fb = heap_caps_malloc(W * H * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     scene_buf = heap_caps_malloc(W * H * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!fb || !scene_buf) {
@@ -437,12 +472,14 @@ void app_main(void)
         // --- ImsaiGuy scene ---
         wait_sent();
         send_rows(scene_buf, 0, H - 1);
+        rgb_set(0, RGB_LEVEL, 0);                           // green = ImsaiGuy scene
         ESP_LOGI(TAG, "Showing ImsaiGuy scene");
         TickType_t ts = xTaskGetTickCount();
         memcpy(fb, photo_rgb565, sizeof(photo_rgb565));   // only the scene is in flight; put the plain photo back
         vTaskDelayUntil(&ts, pdMS_TO_TICKS(5000));
 
         // --- photo with animated LEDs ---
+        rgb_set(RGB_LEVEL, 0, 0);                           // red = photo with animated LEDs
         ESP_LOGI(TAG, "Showing photo");
         int64_t t0 = esp_timer_get_time(), now;
         int last = -1, frames = 0;
